@@ -14,13 +14,14 @@ from pydantic import BaseModel, validator, EmailStr, Field
 from typing import Optional, Union, Dict, Any
 import logging
 import json
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from app.services.user_service import user_service, AuthType, AuthStatus
 from app.core.dependencies import get_current_user
 from app.core.exceptions import AuthenticationError, ValidationError
 from app.models.user import User, UserResponse
-from app.models.profile import PersonProfile, ProfileResponse
+from app.models.profile import PersonProfile, ProfileResponse, Prediction, PredictionType
 from app.config.firebase import get_firestore_client
 from app.config.settings import settings
 from datetime import datetime
@@ -32,6 +33,11 @@ from app.core.security import validate_email, validate_phone_number, sanitize_in
 from app.services.enhanced_astrology_service import enhanced_astrology_service
 import httpx
 import secrets
+from app.services.chatgpt_service import chatgpt_service
+from app.models.profile import  PredictionType
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +343,8 @@ async def get_user_details(current_user: str = Depends(get_current_user)):
             }
             enhanced_profiles.append(enhanced_profile)
 
+        logger.info(f"Hiii: {current_user}")
+
         # Get recent predictions for all profiles
         recent_predictions = []
         for profile in enhanced_profiles:
@@ -351,18 +359,31 @@ async def get_user_details(current_user: str = Depends(get_current_user)):
                     "expires_at": pred.expires_at.isoformat() if pred.expires_at and hasattr(pred.expires_at, 'isoformat') else str(pred.expires_at)
                 })
 
+        logger.info(f"******** reebct: {recent_predictions}")
+
         # Sort predictions by creation date (most recent first)
         recent_predictions.sort(key=lambda x: x['created_at'], reverse=True)
 
-        # Create summary
-        total_predictions = sum(len(await enhanced_astrology_service.get_predictions(current_user, p['id'])) for p in enhanced_profiles)
+        created_at = to_aware_utc(user_data.get('createdAt'))
+        last_login = to_aware_utc(user_data.get('lastLoginAt'))
+
+        total_predictions = 0
+        for p in enhanced_profiles:
+            preds = await enhanced_astrology_service.get_predictions(current_user, p['id'])
+            total_predictions += len(preds)
 
         summary = {
             "total_profiles": len(enhanced_profiles),
             "total_predictions": total_predictions,
             "subscription_status": user_data.get('subscriptionType', 'free'),
-            "account_age_days": (datetime.utcnow() - user_data.get('createdAt')).days if user_data.get('createdAt') else 0,
-            "last_activity_days": (datetime.utcnow() - user_data.get('lastLoginAt')).days if user_data.get('lastLoginAt') else 0,
+            "account_age_days": (
+                (datetime.now(timezone.utc) - created_at).days
+                if created_at else 0
+            ),
+            "last_activity_days": (
+                (datetime.now(timezone.utc) - last_login).days
+                if last_login else 0
+            ),
             "astrology_calculation_method": "production_api"
         }
 
@@ -391,6 +412,15 @@ async def get_user_details(current_user: str = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"❌ Failed to fetch user details for {current_user}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch user details")
+
+
+def to_aware_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 
 @router.get("/session-status")
 async def get_session_status(
@@ -461,6 +491,40 @@ def _mask_identifier(identifier: str, auth_type: str) -> str:
         if len(identifier) > 6:
             return identifier[:3] + '*' * (len(identifier) - 6) + identifier[-3:]
     return identifier
+
+def _safe_parse_timestamp(timestamp):
+    """Safely parse timestamp that might be string, datetime, or Firestore timestamp"""
+    if not timestamp:
+        return None
+    if hasattr(timestamp, 'isoformat'):
+        # It's a datetime or Firestore timestamp
+        return timestamp.isoformat()
+    if isinstance(timestamp, str):
+        try:
+            # Try to parse as ISO string
+            from datetime import datetime
+            parsed = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            return parsed.isoformat()
+        except ValueError:
+            # If parsing fails, return as is or None
+            return None
+    return None
+
+def _safe_datetime_diff(now, timestamp):
+    """Safely calculate days difference, handling different timestamp types"""
+    if not timestamp:
+        return 0
+    from datetime import datetime
+    if hasattr(timestamp, '__sub__'):
+        # It's a datetime or Firestore timestamp
+        return (now - timestamp).days
+    if isinstance(timestamp, str):
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            return (now - parsed).days
+        except ValueError:
+            return 0
+    return 0
 
 async def _track_user_login(user_id: str, is_new_user: bool):
     """Background task to track user login analytics"""
@@ -714,6 +778,41 @@ async def create_profile(profile_request: ProfileCreateRequest, request: Request
             'updated_at': datetime.utcnow()
         }, merge=True)
 
+
+        logger.info(f"✅ Profile created for {current_user} (ID: {profile_id})")
+        try:
+            # Generate self-compatibility meter
+            await generate_self_compatibility_meter(
+                profile_id=profile_id,
+                current_user=effective_user_id
+            )
+            logger.info(f"✅ Self-compatibility meter generated for profile {profile_id}")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to generate self-compatibility meter: {e}")
+        
+        try:
+            # Generate planetary strength analysis
+            await generate_planetary_strength_analysis(
+                profile_id=profile_id,
+                current_user=effective_user_id
+            )
+            logger.info(f"✅ Planetary strength analysis generated for profile {profile_id}")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to generate planetary strength analysis: {e}")
+
+        try:
+            # Generate planetary strength analysis
+            await generate_specific_prediction(
+                profile_id=profile_id,
+                prediction_type=PredictionType.DAILY,
+                current_user=effective_user_id
+            )
+            logger.info(f"✅ prediction generated for profile {profile_id}")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to generate prediction strength analysis: {e}")
+            
+
+        logger.info(f"✅ Profile created for {current_user} (ID: {profile_id})")
         # Return the created profile
         return ProfileResponse(**profile_data)
 
@@ -730,6 +829,223 @@ async def create_profile(profile_request: ProfileCreateRequest, request: Request
     except Exception as e:
         logger.error(f"Profile creation failed for user {current_user}: {e}")
         raise HTTPException(status_code=500, detail="Profile creation failed")
+
+async def generate_self_compatibility_meter(
+    profile_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Generate an AI-powered analysis of a profile's internal astrological harmony.
+    This replaces the two-person compatibility check.
+    """
+    try:
+        db = get_firestore_client()
+        logger.info(f"*****************: {current_user}")
+        # 1. Fetch profile and verify ownership
+        profile_ref = db.collection('person_profiles').document(profile_id)
+        profile_doc = profile_ref.get()
+        if not profile_doc.exists:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Profile {profile_id} not found")
+        
+        profile_data = profile_doc.to_dict()
+        if profile_data.get('user_id') != current_user:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied to profile")
+
+        # 2. Construct prompt for AI service
+        def extract_astro_details(data):
+            # Extract relevant details for the prompt
+            return {
+                "ascendant": data.get("ascendant", "N/A"),
+                "zodiac_sign": data.get("zodiac_sign", "N/A"), # Assuming 'rasi' is in the profile data
+                "guna": data.get("guna", "N/A"),
+                "element": data.get("element", "N/A")
+            }
+        
+        details = extract_astro_details(profile_data)
+        logger.info(f"*****************: {details}")
+
+        prompt = (
+            f"Analyze the internal astrological harmony of a person for self-awareness. "
+            f"Astrological Details: Ascendant - {details['ascendant']}, zodiac_sign - {details['zodiac_sign']}, Guna - {details['guna']}. "
+            "Based on these core traits, evaluate their internal alignment and potential challenges. "
+            "Return a JSON object with three keys: 'emotional_balance_score', 'mental_clarity_score', 'physical_vitality_score','overall_match'. "
+            "The values must be floats between 0.0 and 1.0. Higher scores indicate better harmony. "
+            "Do not add any other text, explanations, or markdown."
+        )
+
+        # 3. Call AI service and parse the response
+        # Assuming a service function that takes a raw prompt
+        raw_json_response = await chatgpt_service.generate_raw_completion(prompt)
+        try:
+            meter_data = json.loads(raw_json_response)
+        except json.JSONDecodeError:
+            logger.error(f"AI service returned malformed JSON: {raw_json_response}")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "AI service returned unparsable data")
+
+        # 4. Save the result to the 'compatibility_meter' collection with a new structure
+        meter_id =profile_id
+        
+        data_to_save = {
+            "profile_id": profile_id,
+            "user_id": current_user,
+            "emotional_score": meter_data.get("emotional_balance_score"),
+            "mental_score": meter_data.get("mental_clarity_score"),
+            "physical_score": meter_data.get("physical_vitality_score"),
+            "overall_match": meter_data.get("overall_match"),
+            "last_updated": datetime.utcnow().isoformat()
+        }
+        
+        # Using the same collection but a different ID format to distinguish
+        db.collection('compatibility_meter').document(meter_id).set(data_to_save)
+
+        return {
+            "message": "Self-compatibility meter generated successfully.",
+            "meter_id": meter_id,
+            "data": data_to_save
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate self-compatibility meter for profile {profile_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An unexpected error occurred: {str(e)}")
+
+
+async def generate_planetary_strength_analysis(
+    profile_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Generate a detailed planetary strength analysis for a profile using ChatGPT.
+    Saves results to Firestore collection 'planetary_strength_analysis'.
+    """
+    try:
+        db = get_firestore_client()
+        logger.info(f"🔭 Starting planetary strength analysis for user: {current_user}")
+
+        # 1. Fetch and verify profile
+        profile_ref = db.collection('person_profiles').document(profile_id)
+        profile_doc = profile_ref.get()
+        if not profile_doc.exists:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Profile {profile_id} not found")
+
+        profile_data = profile_doc.to_dict()
+        if profile_data.get("user_id") != current_user:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied to this profile")
+
+        # 2. Build AI prompt
+        prompt = (
+            f"Analyze the planetary strength for this person based on their astrological details.\n"
+            f"Profile Info: Ascendant - {profile_data.get('ascendant', 'N/A')}, "
+            f"Zodiac Sign - {profile_data.get('zodiac_sign', 'N/A')}, "
+            f"Guna - {profile_data.get('guna', 'N/A')}, Element - {profile_data.get('element', 'N/A')}.\n\n"
+            "Return a JSON object with:\n"
+            "- 'overall_rating': string (like 'Strong', 'Moderate', or 'Weak')\n"
+            "- 'overall_strength': float (0.0–1.0)\n"
+            "- 'planets': array of objects, each having keys: 'planet', 'natchathra', 'position', and 'strength' (float).\n"
+            "Provide only valid JSON without any text or explanation."
+        )
+
+        # 3. Generate raw JSON from ChatGPT
+        raw_json_response = await chatgpt_service.generate_raw_completion(prompt)
+        try:
+            analysis_data = json.loads(raw_json_response)
+        except json.JSONDecodeError:
+            logger.error(f"Malformed JSON from ChatGPT: {raw_json_response}")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "AI returned invalid JSON format")
+
+        # 4. Prepare data for Firestore
+        data_to_save = {
+            "profile_id": profile_id,
+            "user_id": current_user,
+            "overall_rating": analysis_data.get("overall_rating"),
+            "overall_strength": analysis_data.get("overall_strength"),
+            "planets": analysis_data.get("planets", []),
+            "last_updated": datetime.utcnow().isoformat()
+        }
+
+        # 5. Save to Firestore collection: planetary_strength_analysis
+        db.collection("planetary_strength_analysis").document(profile_id).set(data_to_save)
+
+        logger.info(f"✅ Planetary strength analysis saved for profile {profile_id}")
+        return {
+            "message": "Planetary strength analysis generated successfully.",
+            "profile_id": profile_id,
+            "data": data_to_save
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate planetary strength analysis for {profile_id}: {e}")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+async def generate_specific_prediction(
+    profile_id: str,
+    prediction_type: PredictionType,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Generate structured AI prediction and save it to Firestore.
+    """
+    try:
+        db = get_firestore_client()
+        profile_ref = db.collection("person_profiles").document(profile_id)
+        profile_doc = profile_ref.get()
+
+        if not profile_doc.exists:
+            raise HTTPException(status_code=404, detail=f"Profile {profile_id} not found")
+
+        profile_data = profile_doc.to_dict()
+
+        # Get astrology chart
+        chart_data = await enhanced_astrology_service._generate_astrology_chart(
+            current_user, profile_id, profile_data
+        )
+
+        logger.info(f"*****************: {chart_data}")
+
+        # Get structured prediction JSON from ChatGPT
+        prediction_json = await chatgpt_service.generate_personal_predictionsbyme(
+            profile_data, chart_data, prediction_type.value
+        )
+
+        now = datetime.utcnow()
+        prediction_text = json.dumps(prediction_json)
+
+        # Create Prediction object
+        prediction_obj = Prediction(
+            id=f"{profile_id}_{prediction_type.value}_{now.strftime('%Y%m%d_%H%M%S')}",
+            profile_id=profile_id,
+            user_id=current_user,
+            prediction_type=PredictionType(prediction_type.value),
+            prediction_text=prediction_text,
+            generated_by="chatgpt",
+            created_at=now,
+            updated_at=now,
+            expires_at=None  # No expiration for structured predictions
+        )
+
+        # Save to Firestore
+        doc_id = prediction_obj.id
+        db.collection("predictions").document(doc_id).set(prediction_obj.dict())
+
+        return {
+            "message": f"{prediction_type.value.title()} prediction generated successfully",
+            "prediction": prediction_json,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate structured prediction: {str(e)}"
+        )
+
+
+
 
 @router.get("/profiles/{profile_id}")
 async def get_profile_or_status(profile_id: str, current_user: str = Depends(get_current_user)):

@@ -623,6 +623,7 @@ import os
 import json
 import logging
 import asyncio
+
 from typing import Dict, List, Optional, Any
 from datetime import datetime, date, time
 
@@ -1093,7 +1094,191 @@ Your task is to generate a complete marriage matching report for the given bride
         except Exception as e:
             logger.error(f"Failed to get marriage prompt from database: {e}")
             return None
+        
 
+    async def generate_raw_completion(self, prompt: str) -> str:
+        """
+        Generate a raw JSON completion from ChatGPT given a text prompt.
+        This method directly returns the AI-generated text (expected to be valid JSON).
+        Used for self-compatibility or other structured responses.
+        """
+        try:
+            if not self.client:
+                raise ValueError("OpenAI client not initialized. Check API key configuration.")
+
+            # Enforce rate limiting
+            self._check_rate_limit()
+
+            logger.info("🧠 Generating raw completion from ChatGPT...")
+
+            # Retry with backoff for transient errors
+            response = await self._retry_with_backoff(
+                self._make_openai_request,
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a precise JSON generator. Return ONLY valid JSON objects without explanations.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+            )
+
+            # Safely extract text content
+            try:
+                message = response.choices[0].message
+                raw_output = getattr(message, "content", None) or message.get("content")
+                result = raw_output.strip()
+            except Exception:
+                logger.warning("⚠️ Fallback: unable to parse structured response, converting to string.")
+                result = str(response)
+
+            logger.info("✅ Successfully generated raw completion.")
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ Failed to generate raw completion: {e}")
+            raise
+
+
+    async def generate_personal_predictionsbyme(
+        self,
+        profile_data: Dict[str, Any],
+        chart_data: Dict[str, Any],
+        prediction_type: str = "daily",
+    ) -> Dict[str, Any]:
+        """
+        Generate structured astrology predictions (JSON format) using ChatGPT.
+        """
+        try:
+            if not self.client:
+                raise ValueError("OpenAI client not initialized. Check API key configuration.")
+
+            # Create structured prompt
+            prompt = f"""
+            You are an expert Vedic astrologer. 
+            Based on the user's birth chart and astrology data, generate a structured JSON prediction
+            that includes daily, weekly, and monthly forecasts. 
+            Use the following schema (return **ONLY valid JSON**, nothing else):
+
+            {{
+            "daily_predictions": {{
+                "categories": [
+                {{
+                    "key": "general",
+                    "title": "string",
+                    "subtitle": "string",
+                    "description": "string",
+                    "energy_level": "High|Medium|Low",
+                    "luck_factor": "string",
+                    "mood_icon": "emoji"
+                }},
+                {{
+                    "key": "career",
+                    "title": "string",
+                    "subtitle": "string",
+                    "description": "string",
+                    "energy_level": "string",
+                    "luck_factor": "string",
+                    "mood_icon": "emoji"
+                }},
+                {{
+                    "key": "health",
+                    "title": "string",
+                    "subtitle": "string",
+                    "description": "string",
+                    "energy_level": "string",
+                    "luck_factor": "string",
+                    "mood_icon": "emoji"
+                }},
+                {{
+                    "key": "spiritual",
+                    "title": "string",
+                    "subtitle": "string",
+                    "description": "string",
+                    "energy_level": "string",
+                    "luck_factor": "string",
+                    "mood_icon": "emoji"
+                }}
+                ],
+                "date": "string"
+            }},
+            "weekly_predictions": {{
+                "key_events": ["string", "string"],
+                "overview": "string",
+                "period": "string"
+            }},
+            "monthly_predictions": {{
+                "key_themes": ["string", "string"],
+                "overview": "string",
+                "period": "string"
+            }}
+            }}
+
+            Use astrology logic to fill realistic and creative predictions.
+            Do NOT include markdown, text outside JSON, or explanations.
+            Birth chart data: {chart_data}
+            Profile data: {profile_data}
+            """
+
+            response = await self._retry_with_backoff(
+                self._make_openai_request,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a master astrologer who always replies with valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                timeout=self.timeout,
+            )
+
+            message = response.choices[0].message
+            content = getattr(message, "content", None) or message.get("content")
+
+            # Parse JSON safely
+            try:
+                prediction_json = json.loads(content)
+            except json.JSONDecodeError:
+                logger.warning("⚠️ ChatGPT returned invalid JSON; using fallback")
+                # Return a basic structured prediction
+                mock_text = self._generate_mock_prediction(profile_data, "daily")
+                prediction_json = {
+                    "daily_predictions": {
+                        "categories": [
+                            {
+                                "key": "general",
+                                "title": "General Outlook",
+                                "subtitle": "Daily Prediction",
+                                "description": mock_text,
+                                "energy_level": "Medium",
+                                "luck_factor": "Neutral",
+                                "mood_icon": "😐"
+                            }
+                        ],
+                        "date": datetime.utcnow().isoformat()
+                    },
+                    "weekly_predictions": {
+                        "key_events": ["Work", "Health"],
+                        "overview": self._generate_mock_prediction(profile_data, "weekly"),
+                        "period": "This week"
+                    },
+                    "monthly_predictions": {
+                        "key_themes": ["Career", "Relationships"],
+                        "overview": self._generate_mock_prediction(profile_data, "monthly"),
+                        "period": "This month"
+                    }
+                }
+
+            return prediction_json
+
+        except Exception as e:
+            logger.error(f"Failed to generate structured prediction: {e}")
+            logger.info("🔄 Using fallback prediction generation")
+            return self._generate_mock_prediction(profile_data, prediction_type)
 
 # Global service instance
 chatgpt_service = ChatGPTService()

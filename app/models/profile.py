@@ -89,6 +89,7 @@ class Prediction(BaseModel):
             datetime: lambda v: v.isoformat()
         }
         use_enum_values = True
+        extra = "ignore"  # Allow extra fields to be ignored
 
 class PredictionResponse(BaseModel):
     """Response model for predictions"""

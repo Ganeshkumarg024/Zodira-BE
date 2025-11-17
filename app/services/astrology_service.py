@@ -705,7 +705,7 @@ class AstrologyService:
     # Persist raw parts for Rasi/Navamsa/D10/Chandra/Shadbala
     async def _save_chart_parts_to_db(self, user_id: str, profile_id: str, parts: Dict[str, Any]) -> None:
         try:
-            doc_id = f"{user_id}_{profile_id}"
+            doc_id = profile_id
             doc_ref = self.db.collection('astrology_chart_parts').document(doc_id)
 
             # Preserve created_at if updating
@@ -766,7 +766,7 @@ class AstrologyService:
                 logger.warning(f"Invalid chart_type requested: {chart_type}")
                 return None
 
-            doc_id = f"{user_id}_{profile_id}"
+            doc_id = profile_id
             doc_ref = self.db.collection('astrology_chart_parts').document(doc_id)
             doc = doc_ref.get()
             if not doc.exists:
@@ -817,7 +817,7 @@ class AstrologyService:
             data = await self._fetch_chart_with_cache(url, birth_details, cache_file)
 
             # Write/merge to Firestore chart parts doc
-            doc_id = f"{user_id}_{profile_id}"
+            doc_id = profile_id
             doc_ref = self.db.collection('astrology_chart_parts').document(doc_id)
 
             # Preserve created_at if updating

@@ -4,7 +4,9 @@ from typing import List
 import secrets
 import logging
 
+
 logger = logging.getLogger(__name__)
+
 
 class Settings(BaseSettings):
     # Firebase Configuration
@@ -14,15 +16,15 @@ class Settings(BaseSettings):
     # Application Settings
     app_name: str = "ZODIRA Backend"
     app_version: str = "1.0.0"
-    debug: bool = config('APP_DEBUG', default=False, cast=bool)  # Changed from DEBUG to APP_DEBUG
+    debug: bool = config('APP_DEBUG', default=False, cast=bool)
     environment: str = config('ENVIRONMENT', default='development')
 
     # Security Configuration
     secret_key: str = config('SECRET_KEY', default='dev-secret-key-change-in-production-min-32-chars')
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = config('ACCESS_TOKEN_EXPIRE_MINUTES', default=43200, cast=int)  # 30 days (60 * 24 * 30)
+    access_token_expire_minutes: int = config('ACCESS_TOKEN_EXPIRE_MINUTES', default=43200, cast=int)
     
-    # CORS Configuration - Accept all origins for development
+    # CORS Configuration
     allowed_origins: List[str] = config(
         'ALLOWED_ORIGINS',
         default='*',
@@ -33,10 +35,8 @@ class Settings(BaseSettings):
     rate_limit_requests: int = config('RATE_LIMIT_REQUESTS', default=100, cast=int)
     rate_limit_window: int = config('RATE_LIMIT_WINDOW', default=60, cast=int)
     
-    # SMS Configuration (for phone verification)
+    # SMS Configuration
     sms_provider: str = config('SMS_PROVIDER', default='mydreams')
-    
-    # MyDreams Technology SMS API Configuration
     mydreams_api_url: str = config('MYDREAMS_API_URL', default='http://app.mydreamstechnology.in/vb/apikey.php')
     mydreams_api_key: str = config('MYDREAMS_API_KEY', default='zbAG4xSPKhwqPCI3')
     mydreams_sender_id: str = config('MYDREAMS_SENDER_ID', default='MYDTEH')
@@ -61,19 +61,31 @@ class Settings(BaseSettings):
 
     # OpenAI ChatGPT Configuration
     openai_api_key: str = config('OPENAI_API_KEY', default='')
-
-    # OpenAI Model Configuration (Modern Best Practices)
-    openai_model: str = config('OPENAI_MODEL', default='gpt-3.5-turbo')
+    openai_model: str = config('OPENAI_MODEL', default='gpt-5-chat-latest')
     openai_max_tokens: int = config('OPENAI_MAX_TOKENS', default=2000, cast=int)
     openai_temperature: float = config('OPENAI_TEMPERATURE', default=0.3, cast=float)
     openai_timeout: int = config('OPENAI_TIMEOUT', default=30, cast=int)
     openai_max_retries: int = config('OPENAI_MAX_RETRIES', default=3, cast=int)
     openai_rate_limit_per_minute: int = config('OPENAI_RATE_LIMIT_PER_MINUTE', default=50, cast=int)
 
+    # ========================================
+    # 💰 RAZORPAY PAYMENT GATEWAY CONFIGURATION
+    # ========================================
+    razorpay_key_id: str = config('RAZORPAY_KEY_ID', default='')
+    razorpay_key_secret: str = config('RAZORPAY_KEY_SECRET', default='')
+    razorpay_webhook_secret: str = config('RAZORPAY_WEBHOOK_SECRET', default='')
+    
+    # Payment Configuration
+    payment_min_amount: float = config('PAYMENT_MIN_AMOUNT', default=10.0, cast=float)
+    payment_max_amount: float = config('PAYMENT_MAX_AMOUNT', default=100000.0, cast=float)
+    payment_currency: str = config('PAYMENT_CURRENCY', default='INR')
+    
+    # Wallet Configuration
+    wallet_enabled: bool = config('WALLET_ENABLED', default=True, cast=bool)
+    wallet_bonus_on_first_add: float = config('WALLET_BONUS_ON_FIRST_ADD', default=0.0, cast=float)
+    
     # Client/Frontend Configuration
     api_base_url: str = config('API_BASE_URL', default='')
-
-    # Redis removed: using Firestore for sessions and rate limits
     
     # Logging Configuration
     log_level: str = config('LOG_LEVEL', default='INFO')
@@ -91,7 +103,6 @@ class Settings(BaseSettings):
                 logger.critical("SECURITY ALERT: Default SECRET_KEY used in production!")
                 raise ValueError("SECRET_KEY must be set to a secure value in production environment")
             else:
-                # Generate secure key for development
                 self.secret_key = secrets.token_urlsafe(32)
                 logger.warning(f"Generated secure SECRET_KEY for {self.environment} environment")
         
@@ -99,22 +110,28 @@ class Settings(BaseSettings):
         if self.firebase_project_id == 'your-firebase-project-id':
             logger.warning("Firebase project ID not configured - using default")
         
-        # Validate payment configuration (temporarily disabled)
-        # if self.razorpay_key_id == 'your_razorpay_key_id':
-        #     logger.warning("Razorpay configuration not set - payments will not work")
+        # Validate Razorpay configuration
+        if not self.razorpay_key_id or not self.razorpay_key_secret:
+            logger.warning("⚠️ Razorpay credentials not configured - payment features will be disabled")
+        else:
+            logger.info("✅ Razorpay payment gateway configured")
+            
+        if not self.razorpay_webhook_secret and self.environment == 'production':
+            logger.warning("⚠️ Razorpay webhook secret not set in production - webhook verification will fail")
         
         # Validate CORS origins
         if '*' in self.allowed_origins:
             logger.info("Wildcard CORS origin enabled for all environments")
         
-        # Google OAuth optional: keep app running even if not configured
+        # Google OAuth optional
         if not self.google_client_id or not self.google_client_secret or not self.redirect_uri:
-            logger.info("Google OAuth not fully configured; endpoints relying on Google OAuth will be inactive until GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/REDIRECT_URI are set")
+            logger.info("Google OAuth not fully configured; endpoints relying on Google OAuth will be inactive")
 
     class Config:
         env_file = ".env"
         case_sensitive = True
-        extra = "ignore"  # Ignore extra environment variables
+        extra = "ignore"
+
 
 # Global settings instance
 settings = Settings()
