@@ -278,7 +278,7 @@ async def logout(
         raise HTTPException(status_code=500, detail="Logout failed")
 
 @router.get("/user-details", response_model=UserDetailsResponse)
-async def get_user_details(current_user: str = Depends(get_current_user)):
+async def get_user_details(background_tasks: BackgroundTasks, current_user: str = Depends(get_current_user)):
     """
     Get comprehensive user details including all profile information and astrology data
 
@@ -343,23 +343,28 @@ async def get_user_details(current_user: str = Depends(get_current_user)):
             }
             enhanced_profiles.append(enhanced_profile)
 
-        logger.info(f"Hiii: {current_user}")
+        logger.info(f"User details fetched for: {current_user}")
 
-        # Get recent predictions for all profiles
+        # Start background task to generate fresh predictions (don't wait for it)
+        background_tasks.add_task(_generate_predictions_after_user_details, current_user)
+
+        # Get existing predictions immediately (may include stale ones, but API responds fast)
         recent_predictions = []
         for profile in enhanced_profiles:
-            predictions = await enhanced_astrology_service.get_predictions(current_user, profile['id'])
-            for pred in predictions[:2]:  # Get 2 most recent per profile
-                recent_predictions.append({
-                    "profile_id": pred.profile_id,
-                    "profile_name": profile['name'],
-                    "prediction_type": str(pred.prediction_type),
-                    "prediction_text": pred.prediction_text,
-                    "created_at": pred.created_at.isoformat() if hasattr(pred.created_at, 'isoformat') else str(pred.created_at),
-                    "expires_at": pred.expires_at.isoformat() if pred.expires_at and hasattr(pred.expires_at, 'isoformat') else str(pred.expires_at)
-                })
-
-        logger.info(f"******** reebct: {recent_predictions}")
+            try:
+                predictions = await enhanced_astrology_service.get_predictions(current_user, profile['id'])
+                for pred in predictions[:2]:  # Get 2 most recent per profile
+                    recent_predictions.append({
+                        "profile_id": pred.profile_id,
+                        "profile_name": profile['name'],
+                        "prediction_type": str(pred.prediction_type),
+                        "prediction_text": pred.prediction_text,
+                        "created_at": pred.created_at.isoformat() if hasattr(pred.created_at, 'isoformat') else str(pred.created_at),
+                        "expires_at": pred.expires_at.isoformat() if pred.expires_at and hasattr(pred.expires_at, 'isoformat') else str(pred.expires_at)
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to get predictions for profile {profile['id']}: {e}")
+                # Continue with other profiles
 
         # Sort predictions by creation date (most recent first)
         recent_predictions.sort(key=lambda x: x['created_at'], reverse=True)
@@ -534,6 +539,145 @@ async def _track_user_login(user_id: str, is_new_user: bool):
         # TODO: Integrate with analytics service
     except Exception as e:
         logger.error(f"User login tracking failed: {e}")
+
+async def _generate_predictions_after_user_details(user_id: str):
+    """
+    Generate fresh predictions for user's profiles after user-details API call.
+    This runs as a background task to avoid delaying the API response.
+    """
+    try:
+        logger.info(f"🔄 BACKGROUND TASK: Starting prediction generation for user-details API, user: {user_id}")
+
+        # Get user's active profiles
+        db = get_firestore_client()
+        profiles_query = db.collection('person_profiles').where(
+            filter=FieldFilter('user_id', '==', user_id)
+        ).where(filter=FieldFilter('is_active', '==', True))
+
+        profiles_docs = profiles_query.get()
+
+        if not profiles_docs:
+            logger.info(f"No active profiles found for user {user_id}, skipping prediction generation")
+            return
+
+        logger.info(f"Found {len(profiles_docs)} active profiles for user {user_id}")
+
+        # Generate fresh predictions for each profile
+        for doc in profiles_docs:
+            try:
+                profile_data = doc.to_dict()
+                profile_id = doc.id
+
+                logger.info(f"Checking predictions for profile {profile_id}")
+
+                # Check existing predictions
+                existing_predictions = await enhanced_astrology_service.get_predictions(user_id, profile_id)
+                logger.info(f"Found {len(existing_predictions)} existing predictions for profile {profile_id}")
+
+                # Check if we need to generate fresh predictions
+                needs_daily = True
+                needs_weekly = True
+                needs_yearly = True
+                needs_career = True
+                needs_health = True
+
+                for pred in existing_predictions:
+                    pred_type = str(pred.prediction_type)
+                    if pred_type == "PredictionType.DAILY" or pred_type == "DAILY":
+                        # Check if daily prediction is still valid (not expired)
+                        if pred.expires_at and pred.expires_at > datetime.utcnow():
+                            needs_daily = False
+                    elif pred_type == "PredictionType.WEEKLY" or pred_type == "WEEKLY":
+                        needs_weekly = False
+                    elif pred_type == "PredictionType.YEARLY" or pred_type == "YEARLY":
+                        needs_yearly = False
+                    elif pred_type == "PredictionType.CAREER" or pred_type == "CAREER":
+                        needs_career = False
+                    elif pred_type == "PredictionType.HEALTH" or pred_type == "HEALTH":
+                        needs_health = False
+
+                # Generate missing predictions
+                prediction_types_to_generate = []
+                if needs_daily:
+                    prediction_types_to_generate.append(PredictionType.DAILY)
+                if needs_weekly:
+                    prediction_types_to_generate.append(PredictionType.WEEKLY)
+                if needs_yearly:
+                    prediction_types_to_generate.append(PredictionType.YEARLY)
+                if needs_career:
+                    prediction_types_to_generate.append(PredictionType.CAREER)
+                if needs_health:
+                    prediction_types_to_generate.append(PredictionType.HEALTH)
+
+                if prediction_types_to_generate:
+                    logger.info(f"Generating {len(prediction_types_to_generate)} fresh predictions for profile {profile_id}")
+
+                    # Generate predictions for each missing type asynchronously
+                    for pred_type in prediction_types_to_generate:
+                        try:
+                            if pred_type == PredictionType.YEARLY:
+                                # Call the yearly prediction logic directly (same as the API endpoint)
+                                chart_data = await enhanced_astrology_service._generate_astrology_chart(
+                                    user_id, profile_id, profile_data
+                                )
+
+                                logger.info(f"*****************: {chart_data}")
+
+                                # Get structured prediction JSON from ChatGPT (same as API endpoint)
+                                prediction_json = await chatgpt_service.generate_personal_predictionsbyme(
+                                    profile_data, chart_data, pred_type.value
+                                )
+
+                                now = datetime.utcnow()
+                                prediction_json["generated_by"] = "chatgpt"
+                                prediction_json["created_at"] = now
+                                prediction_json["updated_at"] = now
+
+                                # Save to Firestore (same as API endpoint)
+                                doc_id = profile_id
+                                db.collection("predictions").document(doc_id).set(prediction_json)
+
+                                logger.info(f"✅ Generated YEARLY prediction for profile {profile_id} via background task")
+                            else:
+                                # For other prediction types, use direct service calls
+                                chart_data = await enhanced_astrology_service._generate_astrology_chart(
+                                    user_id, profile_id, profile_data
+                                )
+
+                                prediction_json = await chatgpt_service.generate_personal_predictionsbyme(
+                                    profile_data, chart_data, pred_type.value
+                                )
+
+                                now = datetime.utcnow()
+                                prediction_json["generated_by"] = "chatgpt"
+                                prediction_json["created_at"] = now
+                                prediction_json["updated_at"] = now
+
+                                # Save to Firestore
+                                doc_id = f"{profile_id}_{pred_type.value}"
+                                db.collection("predictions").document(doc_id).set(prediction_json)
+
+                                logger.info(f"✅ Generated {pred_type.value} prediction for profile {profile_id}")
+                        except Exception as pred_error:
+                            logger.error(f"Failed to generate {pred_type.value} prediction for profile {profile_id}: {pred_error}")
+                            # Continue with other prediction types
+
+                    logger.info(f"✅ Generated fresh predictions for profile {profile_id}")
+                else:
+                    logger.info(f"✅ All predictions are up-to-date for profile {profile_id}")
+
+            except Exception as e:
+                logger.error(f"Failed to check/generate predictions for profile {doc.id}: {e}")
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                # Continue with other profiles even if one fails
+
+        logger.info(f"✅ COMPLETED: Background prediction generation for user {user_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed background prediction generation for user {user_id}: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
 
 # Health check endpoint for authentication service (Redis removed)
 @router.get("/health")
